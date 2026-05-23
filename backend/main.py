@@ -1,9 +1,7 @@
 import os
 import uuid
-import json
-import re
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -11,10 +9,7 @@ from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 import chromadb
 from dotenv import load_dotenv
-try:
-    from groq import Groq
-except Exception:
-    Groq = None
+from groq import Groq
 
 load_dotenv()
 
@@ -36,87 +31,6 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 security = HTTPBearer()
-
-def parse_json_object(text: str) -> Optional[dict]:
-    try:
-        return json.loads(text)
-    except Exception:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            return None
-
-def mark_contradicted_memory_outdated(new_memory_id: str, new_memory_text: str) -> Optional[str]:
-    if not GROQ_API_KEY or Groq is None:
-        return None
-
-    results = collection.get()
-    ids = results.get("ids") or []
-    if not ids:
-        return None
-
-    existing = []
-    meta_by_id = {}
-    docs = results.get("documents") or []
-    metas = results.get("metadatas") or []
-    for idx, mid in enumerate(ids):
-        if mid == new_memory_id:
-            continue
-        if idx >= len(docs) or idx >= len(metas):
-            continue
-        doc = docs[idx]
-        meta = metas[idx]
-        existing.append({"id": mid, "text": doc})
-        meta_by_id[mid] = meta
-
-    if not existing:
-        return None
-
-    client = Groq(api_key=GROQ_API_KEY)
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        temperature=0,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You detect whether a NEW memory contradicts any EXISTING memory. "
-                    "If a contradiction exists, respond with JSON only: "
-                    "{\"contradicted_id\": \"<existing_id>\", \"reason\": \"...\"}. "
-                    "If no contradiction, respond with JSON only: "
-                    "{\"contradicted_id\": null}."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"new_memory": new_memory_text, "existing_memories": existing},
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-    )
-
-    content = response.choices[0].message.content.strip()
-    parsed = parse_json_object(content)
-    if not parsed:
-        return None
-
-    contradicted_id = parsed.get("contradicted_id")
-    if not contradicted_id or contradicted_id not in meta_by_id:
-        return None
-
-    meta = meta_by_id[contradicted_id] or {}
-    if not isinstance(meta, dict):
-        return None
-    meta = dict(meta)
-    meta["decay_score"] = 0.0
-    meta["outdated"] = True
-    collection.update(ids=[contradicted_id], metadatas=[meta])
-    return contradicted_id
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
@@ -201,7 +115,40 @@ async def create_memory(memory: MemoryCreate, username: str = Depends(get_curren
         ids=[memory_id]
     )
     try:
-        mark_contradicted_memory_outdated(memory_id, memory.text)
+        if GROQ_API_KEY:
+            results = collection.get()
+            ids = results.get("ids") or []
+            docs = results.get("documents") or []
+            existing_pairs = []
+            for idx, mid in enumerate(ids):
+                if mid == memory_id:
+                    continue
+                if idx >= len(docs):
+                    continue
+                existing_pairs.append(f"{mid}: {docs[idx]}")
+
+            if existing_pairs:
+                prompt = (
+                    f"Here is a new memory: {memory.text}. "
+                    f"Here are existing memories with their IDs: {existing_pairs}. "
+                    "Does the new memory contradict any existing memory? "
+                    "Reply with just the ID of the contradicted memory, or reply NONE if no contradiction."
+                )
+                client = Groq(api_key=GROQ_API_KEY)
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    temperature=0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                contradicted_id = (response.choices[0].message.content or "").strip()
+                if contradicted_id and contradicted_id.upper() != "NONE":
+                    existing = collection.get(ids=[contradicted_id])
+                    if existing and existing.get("ids"):
+                        meta = (existing.get("metadatas") or [{}])[0] or {}
+                        if isinstance(meta, dict):
+                            meta = dict(meta)
+                            meta["decay_score"] = 0.0
+                            collection.update(ids=[contradicted_id], metadatas=[meta])
     except Exception:
         pass
     return MemoryResponse(
