@@ -1,0 +1,8 @@
+node_modules/
+__pycache__/
+chroma_data/
+.env
+backend/passlib/
+dist/
+*.pyc
+*.pyo
