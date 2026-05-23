@@ -1,7 +1,9 @@
 import os
 import uuid
+import json
+import re
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -9,6 +11,10 @@ from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 import chromadb
 from dotenv import load_dotenv
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
 
 load_dotenv()
 
@@ -18,6 +24,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "demo")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "memoryos")
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_data")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "llama3-8b-8192"
 
 os.makedirs(CHROMA_DB_PATH, exist_ok=True)
 
@@ -28,6 +36,87 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 security = HTTPBearer()
+
+def parse_json_object(text: str) -> Optional[dict]:
+    try:
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+def mark_contradicted_memory_outdated(new_memory_id: str, new_memory_text: str) -> Optional[str]:
+    if not GROQ_API_KEY or Groq is None:
+        return None
+
+    results = collection.get()
+    ids = results.get("ids") or []
+    if not ids:
+        return None
+
+    existing = []
+    meta_by_id = {}
+    docs = results.get("documents") or []
+    metas = results.get("metadatas") or []
+    for idx, mid in enumerate(ids):
+        if mid == new_memory_id:
+            continue
+        if idx >= len(docs) or idx >= len(metas):
+            continue
+        doc = docs[idx]
+        meta = metas[idx]
+        existing.append({"id": mid, "text": doc})
+        meta_by_id[mid] = meta
+
+    if not existing:
+        return None
+
+    client = Groq(api_key=GROQ_API_KEY)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You detect whether a NEW memory contradicts any EXISTING memory. "
+                    "If a contradiction exists, respond with JSON only: "
+                    "{\"contradicted_id\": \"<existing_id>\", \"reason\": \"...\"}. "
+                    "If no contradiction, respond with JSON only: "
+                    "{\"contradicted_id\": null}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"new_memory": new_memory_text, "existing_memories": existing},
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    )
+
+    content = response.choices[0].message.content.strip()
+    parsed = parse_json_object(content)
+    if not parsed:
+        return None
+
+    contradicted_id = parsed.get("contradicted_id")
+    if not contradicted_id or contradicted_id not in meta_by_id:
+        return None
+
+    meta = meta_by_id[contradicted_id] or {}
+    if not isinstance(meta, dict):
+        return None
+    meta = dict(meta)
+    meta["decay_score"] = 0.0
+    meta["outdated"] = True
+    collection.update(ids=[contradicted_id], metadatas=[meta])
+    return contradicted_id
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
@@ -111,6 +200,10 @@ async def create_memory(memory: MemoryCreate, username: str = Depends(get_curren
         metadatas=[metadata],
         ids=[memory_id]
     )
+    try:
+        mark_contradicted_memory_outdated(memory_id, memory.text)
+    except Exception:
+        pass
     return MemoryResponse(
         id=memory_id,
         text=memory.text,
