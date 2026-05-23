@@ -182,30 +182,42 @@ function showToast(type: "success" | "error", title: string, description: string
   }, 4000);
 }
 
+function detectPlatform() {
+  const url = window.location.href;
+  if (url.includes("claude.ai")) return "Claude";
+  if (url.includes("chatgpt.com") || url.includes("chat.openai.com")) return "ChatGPT";
+  return "ChatGPT";
+}
+
 // 4. Capture and Process Assistant Message
 function handleSaveMemory() {
-  // Select all assistant turns on ChatGPT
-  // ChatGPT elements:
-  // - Message list items have markdown contents
-  // - Roles are sometimes marked with attributes or inside elements
-  // We scan the DOM for:
-  // 1) ChatGPT v4 style: div[data-message-author-role="assistant"]
-  // 2) General markdown blocks inside ChatGPT conversations:
-  //    Usually, assistant is the even turns or marked clearly.
-  
-  const assistantMessageElements = document.querySelectorAll('div[data-message-author-role="assistant"]');
+  const platform = detectPlatform();
   let text = "";
-  
-  if (assistantMessageElements.length > 0) {
-    const lastEl = assistantMessageElements[assistantMessageElements.length - 1];
-    // Retrieve text content but preserve basic linebreaks/formatting
-    const markdownBody = lastEl.querySelector(".markdown") || lastEl;
-    text = markdownBody.textContent || "";
+
+  if (platform === "Claude") {
+    const selectors = ["div[data-is-streaming]", ".font-claude-message", "div.grid.gap-2"];
+    let lastEl: Element | null = null;
+    for (const selector of selectors) {
+      const matches = document.querySelectorAll(selector);
+      if (matches.length > 0) {
+        lastEl = matches[matches.length - 1];
+        break;
+      }
+    }
+    if (lastEl) {
+      text = lastEl.textContent || "";
+    }
   } else {
-    // Fallback: search for elements with class markdown
-    const markdowns = document.querySelectorAll(".markdown");
-    if (markdowns.length > 0) {
-      text = markdowns[markdowns.length - 1].textContent || "";
+    const assistantMessageElements = document.querySelectorAll('div[data-message-author-role="assistant"]');
+    if (assistantMessageElements.length > 0) {
+      const lastEl = assistantMessageElements[assistantMessageElements.length - 1];
+      const markdownBody = lastEl.querySelector(".markdown") || lastEl;
+      text = markdownBody.textContent || "";
+    } else {
+      const markdowns = document.querySelectorAll(".markdown");
+      if (markdowns.length > 0) {
+        text = markdowns[markdowns.length - 1].textContent || "";
+      }
     }
   }
   
@@ -225,7 +237,7 @@ function handleSaveMemory() {
       type: "SAVE_MEMORY",
       payload: {
         text: text,
-        platform: "ChatGPT",
+        platform: platform,
         timestamp: new Date().toISOString(),
         decay_score: 1.0 // Defaults to 1.0 (fresh memory)
       }
