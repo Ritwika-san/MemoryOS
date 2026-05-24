@@ -127,7 +127,7 @@ function createFAB() {
     </svg>
   `;
   
-  fab.addEventListener("click", handleSaveMemory);
+  fab.addEventListener("click", () => handleSaveMemory());
   document.body.appendChild(fab);
 }
 
@@ -190,8 +190,8 @@ function detectPlatform() {
 }
 
 // 4. Capture and Process Assistant Message
-function handleSaveMemory() {
-  const platform = detectPlatform();
+function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude") {
+  const platform = platformOverride || detectPlatform();
   let text = "";
 
   if (platform === "Claude") {
@@ -259,13 +259,83 @@ function handleSaveMemory() {
   );
 }
 
+const capturedMessageIds = new Set<string>();
+const capturedClaudeElements = new WeakSet<Element>();
+
+function isChatGPTStreaming() {
+  return !!(
+    document.querySelector('button[aria-label="Stop generating"]') ||
+    document.querySelector('[data-testid="stop-button"]')
+  );
+}
+
+function isClaudeStreaming() {
+  const streamingEl = document.querySelector('[data-is-streaming="true"]') || document.querySelector("div[data-is-streaming='true']");
+  if (streamingEl) return true;
+  return false;
+}
+
+function scheduleChatGPTCapture(el: Element) {
+  const messageId = (el as HTMLElement).getAttribute("data-message-id");
+  if (!messageId) return;
+  if (capturedMessageIds.has(messageId)) return;
+
+  const checkAndCapture = () => {
+    if (capturedMessageIds.has(messageId)) return;
+    if (isChatGPTStreaming()) {
+      window.setTimeout(checkAndCapture, 1000);
+      return;
+    }
+    window.setTimeout(() => {
+      if (capturedMessageIds.has(messageId)) return;
+      if (isChatGPTStreaming()) return;
+      capturedMessageIds.add(messageId);
+      handleSaveMemory("ChatGPT");
+    }, 3000);
+  };
+
+  checkAndCapture();
+}
+
+function scheduleClaudeCapture(el: Element) {
+  if (capturedClaudeElements.has(el)) return;
+  if (isClaudeStreaming()) return;
+  capturedClaudeElements.add(el);
+  window.setTimeout(() => {
+    if (isClaudeStreaming()) return;
+    handleSaveMemory("Claude");
+  }, 3000);
+}
+
 // 5. Initialize Content Script
 function init() {
   createFAB();
   
   // In case of SPA navigation, check periodically to keep FAB present
-  const observer = new MutationObserver(() => {
+  const observer = new MutationObserver((mutations) => {
     createFAB();
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!(node instanceof Element)) continue;
+
+        if (node.matches("div[data-message-author-role='assistant']")) {
+          scheduleChatGPTCapture(node);
+        }
+        if (node.matches("div.font-claude-message")) {
+          scheduleClaudeCapture(node);
+        }
+
+        const chatgptNodes = node.querySelectorAll?.("div[data-message-author-role='assistant']");
+        if (chatgptNodes && chatgptNodes.length > 0) {
+          chatgptNodes.forEach((n) => scheduleChatGPTCapture(n));
+        }
+
+        const claudeNodes = node.querySelectorAll?.("div.font-claude-message");
+        if (claudeNodes && claudeNodes.length > 0) {
+          claudeNodes.forEach((n) => scheduleClaudeCapture(n));
+        }
+      }
+    }
   });
   
   observer.observe(document.body, { childList: true, subtree: true });
