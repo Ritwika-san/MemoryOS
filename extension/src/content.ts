@@ -1,3 +1,4 @@
+(() => {
 // Content script for MemoryOS on chat.openai.com and chatgpt.com
 
 // 1. Inject Styles
@@ -106,8 +107,95 @@ styleEl.textContent = `
     color: #94a3b8;
     line-height: 1.4;
   }
+
+  .memory-os-toast-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+  }
+
+  .memory-os-toast-btn {
+    flex: 1;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    color: white;
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .memory-os-toast-btn.yes {
+    background: rgba(16, 185, 129, 0.2);
+    border-color: rgba(16, 185, 129, 0.35);
+  }
+
+  .memory-os-toast-btn.no {
+    background: rgba(239, 68, 68, 0.2);
+    border-color: rgba(239, 68, 68, 0.35);
+  }
 `;
 document.head.appendChild(styleEl);
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function deriveKey(token: string): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(token),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+
+  const salt = enc.encode("memoryos-salt");
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 100_000, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptText(text: string, key: CryptoKey): Promise<string> {
+  const enc = new TextEncoder();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text));
+  const cipherBytes = new Uint8Array(ciphertext);
+  const combined = new Uint8Array(iv.length + cipherBytes.length);
+  combined.set(iv, 0);
+  combined.set(cipherBytes, iv.length);
+  return bytesToBase64(combined);
+}
+
+async function decryptText(encrypted: string, key: CryptoKey): Promise<string> {
+  const data = base64ToBytes(encrypted);
+  const iv = data.slice(0, 12);
+  const cipherBytes = data.slice(12);
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes);
+  return new TextDecoder().decode(plaintext);
+}
+
+void encryptText;
 
 // 2. Create and Inject Floating Action Button (FAB)
 function createFAB() {
@@ -182,6 +270,115 @@ function showToast(type: "success" | "error", title: string, description: string
   }, 4000);
 }
 
+const stalenessCheckedIds = new Set<string>();
+
+function showStalenessToast(id: string, message: string) {
+  const toast = document.createElement("div");
+  toast.className = "memory-os-toast memory-os-staleness-toast";
+  toast.style.top = `${24 + document.querySelectorAll(".memory-os-staleness-toast").length * 96}px`;
+
+  toast.innerHTML = `
+    <div class="memory-os-toast-icon error">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="12" y1="8" x2="12" y2="12"></line>
+        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+      </svg>
+    </div>
+    <div class="memory-os-toast-content">
+      <div class="memory-os-toast-title">This memory may be outdated</div>
+      <div class="memory-os-toast-desc">${message}</div>
+      <div class="memory-os-toast-actions">
+        <button class="memory-os-toast-btn yes" data-action="yes">Yes</button>
+        <button class="memory-os-toast-btn no" data-action="no">No</button>
+      </div>
+    </div>
+  `;
+
+  const removeToast = () => {
+    toast.classList.remove("show");
+    window.setTimeout(() => {
+      toast.remove();
+    }, 450);
+  };
+
+  toast.addEventListener("click", async (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const action = target.getAttribute("data-action");
+    if (!action) return;
+
+    if (action === "yes") {
+      removeToast();
+      return;
+    }
+
+    if (action === "no") {
+      try {
+        const token = await getStoredToken();
+        if (!token) {
+          removeToast();
+          return;
+        }
+        await fetch(`http://127.0.0.1:8000/memories/${id}`, {
+          method: "DELETE",
+          headers: {
+            "Authorization": `Bearer ${token}`
+          }
+        });
+      } finally {
+        removeToast();
+      }
+    }
+  });
+
+  document.body.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add("show");
+  }, 50);
+}
+
+async function fetchAllMemories(token: string) {
+  const res = await fetch("http://127.0.0.1:8000/memories", {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${token}`
+    }
+  });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  if (!Array.isArray(data)) return [];
+  return data;
+}
+
+async function checkStaleMemories() {
+  const token = await getStoredToken();
+  if (!token) return;
+  const key = await deriveKey(token);
+  const memories = await fetchAllMemories(token);
+
+  for (const m of memories) {
+    const id = String(m?.id || "");
+    if (!id) continue;
+    if (stalenessCheckedIds.has(id)) continue;
+    const score = Number(m?.decay_score);
+    if (!(score < 0.3)) continue;
+
+    let text = String(m?.text || "");
+    try {
+      text = await decryptText(text, key);
+    } catch {
+    }
+
+    const preview = text.trim();
+    if (!preview) continue;
+
+    stalenessCheckedIds.add(id);
+    const short = preview.length > 60 ? preview.slice(0, 60) + "..." : preview;
+    showStalenessToast(id, `${short}. Is it still accurate?`);
+  }
+}
+
 function detectPlatform() {
   const url = window.location.href;
   if (url.includes("claude.ai")) return "Claude";
@@ -228,13 +425,14 @@ async function fetchTopMemories(token: string) {
     .slice(0, 5);
 }
 
-function formatInjectedContext(memories: Array<{ text?: string }>) {
+function formatInjectedContext(memories: string[]) {
   const parts = memories
-    .map((m) => (m?.text || "").trim())
+    .map((t) => t.trim())
     .filter(Boolean)
     .slice(0, 5);
-  const joined = parts.map((t) => `${t}.`).join(" ");
-  return `Before we begin, here is context about me from my previous AI conversations: ${joined}`.trim();
+  if (parts.length === 0) return "";
+  const joined = parts.map((t, idx) => `${idx + 1}. ${t}`).join(" ");
+  return `Before we begin, here is context about me: ${joined}`.trim();
 }
 
 function setContentEditableHTML(el: Element, html: string) {
@@ -262,7 +460,24 @@ async function maybeInjectContext() {
     const token = await getStoredToken();
     if (!token) return;
     const memories = await fetchTopMemories(token);
-    const context = formatInjectedContext(memories);
+    const cryptoKey = await deriveKey(token);
+    const decrypted = await Promise.all(
+      memories.map(async (m) => {
+        const raw = String(m?.text || "").trim();
+        if (!raw) return "";
+        try {
+          return await decryptText(raw, cryptoKey);
+        } catch {
+          return "";
+        }
+      })
+    );
+    const trimmed = decrypted
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map((t) => (t.length > 100 ? t.slice(0, 100) + "..." : t))
+      .slice(0, 5);
+    const context = formatInjectedContext(trimmed);
     if (!context) return;
 
     if (platform === "ChatGPT") {
@@ -283,7 +498,7 @@ async function maybeInjectContext() {
 }
 
 // 4. Capture and Process Assistant Message
-function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?: string) {
+function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?: string, isAutoCapture?: boolean) {
   const platform = platformOverride || detectPlatform();
   let text = "";
 
@@ -346,6 +561,9 @@ function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?
       
       if (response && response.success) {
         showToast("success", "Memory Saved!", `"${previewText}" was added to MemoryOS.`);
+        if (isAutoCapture) {
+          void checkStaleMemories();
+        }
       } else {
         const errorMsg = response?.error || "Are you logged into the MemoryOS popup?";
         showToast("error", "Save Failed", errorMsg);
@@ -411,7 +629,7 @@ function scheduleChatGPTCapture(el: Element) {
       window.setTimeout(() => {
         isCaptureInProgress = false;
       }, 5000);
-      handleSaveMemory("ChatGPT", text);
+      handleSaveMemory("ChatGPT", text, true);
     }, 3000);
   };
 
@@ -436,7 +654,7 @@ function scheduleClaudeCapture(el: Element) {
     window.setTimeout(() => {
       isCaptureInProgress = false;
     }, 5000);
-    handleSaveMemory("Claude", text);
+    handleSaveMemory("Claude", text, true);
   }, 3000);
 }
 
@@ -482,3 +700,4 @@ if (document.readyState === "loading") {
 } else {
   init();
 }
+})();
