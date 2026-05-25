@@ -189,12 +189,107 @@ function detectPlatform() {
   return "ChatGPT";
 }
 
+const injectedConversationKeys = new Set<string>();
+const injectingConversationKeys = new Set<string>();
+
+function getChatGPTConversationKey() {
+  if (!window.location.hostname.includes("chatgpt.com")) return null;
+  const match = window.location.pathname.match(/\/c\/([^/?#]+)/);
+  if (!match) return null;
+  return `chatgpt:${match[1]}`;
+}
+
+function getClaudeConversationKey() {
+  if (!window.location.hostname.includes("claude.ai")) return null;
+  return `claude:${window.location.pathname}${window.location.search}`;
+}
+
+function getStoredToken(): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(["token"], (result: { token?: string }) => {
+      resolve(result.token || null);
+    });
+  });
+}
+
+async function fetchTopMemories(token: string) {
+  const res = await fetch("http://127.0.0.1:8000/memories", {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${token}`
+    }
+  });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  if (!Array.isArray(data)) return [];
+  return data
+    .slice()
+    .sort((a, b) => (Number(b?.decay_score) || 0) - (Number(a?.decay_score) || 0))
+    .slice(0, 5);
+}
+
+function formatInjectedContext(memories: Array<{ text?: string }>) {
+  const parts = memories
+    .map((m) => (m?.text || "").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const joined = parts.map((t) => `${t}.`).join(" ");
+  return `Before we begin, here is context about me from my previous AI conversations: ${joined}`.trim();
+}
+
+function setContentEditableHTML(el: Element, html: string) {
+  if (!(el instanceof HTMLElement)) return;
+  el.innerHTML = html;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+async function maybeInjectContext() {
+  const platform = detectPlatform();
+  const key = platform === "Claude" ? getClaudeConversationKey() : getChatGPTConversationKey();
+  if (!key) return;
+  if (injectedConversationKeys.has(key) || injectingConversationKeys.has(key)) return;
+
+  if (platform === "ChatGPT") {
+    if (document.querySelectorAll("div[data-message-author-role='assistant']").length > 0) return;
+    if (!document.querySelector("div#prompt-textarea[contenteditable=true]")) return;
+  } else {
+    if (document.querySelectorAll(".font-claude-message").length > 0) return;
+    if (!document.querySelector("div[contenteditable=true].ProseMirror")) return;
+  }
+
+  injectingConversationKeys.add(key);
+  try {
+    const token = await getStoredToken();
+    if (!token) return;
+    const memories = await fetchTopMemories(token);
+    const context = formatInjectedContext(memories);
+    if (!context) return;
+
+    if (platform === "ChatGPT") {
+      const input = document.querySelector("div#prompt-textarea[contenteditable=true]");
+      if (!input) return;
+      setContentEditableHTML(input, context);
+    } else {
+      const input = document.querySelector("div[contenteditable=true].ProseMirror");
+      if (!input) return;
+      setContentEditableHTML(input, context);
+    }
+
+    injectedConversationKeys.add(key);
+    showToast("success", "Context injected from MemoryOS", "Your AI already knows you.");
+  } finally {
+    injectingConversationKeys.delete(key);
+  }
+}
+
 // 4. Capture and Process Assistant Message
-function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude") {
+function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?: string) {
   const platform = platformOverride || detectPlatform();
   let text = "";
 
-  if (platform === "Claude") {
+  if (textOverride) {
+    text = textOverride;
+  } else if (platform === "Claude") {
     const selectors = ["div[data-is-streaming]", ".font-claude-message", "div.grid.gap-2"];
     let lastEl: Element | null = null;
     for (const selector of selectors) {
@@ -260,7 +355,7 @@ function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude") {
 }
 
 const capturedMessageIds = new Set<string>();
-const capturedClaudeElements = new WeakSet<Element>();
+let isCaptureInProgress = false;
 
 function isChatGPTStreaming() {
   return !!(
@@ -275,22 +370,48 @@ function isClaudeStreaming() {
   return false;
 }
 
+function getMessageKey(el: Element) {
+  if (el instanceof HTMLElement) {
+    const id = el.getAttribute("data-message-id") || el.id;
+    if (id) return id;
+  }
+  const text = (el.textContent || "").trim();
+  if (!text) return null;
+  return text;
+}
+
+function getChatGPTMessageText(el: Element) {
+  if (!(el instanceof HTMLElement)) return (el.textContent || "").trim();
+  const markdownBody = (el.querySelector(".markdown") as HTMLElement | null) || el;
+  return (markdownBody.textContent || "").trim();
+}
+
 function scheduleChatGPTCapture(el: Element) {
-  const messageId = (el as HTMLElement).getAttribute("data-message-id");
-  if (!messageId) return;
-  if (capturedMessageIds.has(messageId)) return;
+  if (isCaptureInProgress) return;
+
+  const key = getMessageKey(el);
+  if (!key) return;
+  if (capturedMessageIds.has(key)) return;
 
   const checkAndCapture = () => {
-    if (capturedMessageIds.has(messageId)) return;
+    if (isCaptureInProgress) return;
+    if (capturedMessageIds.has(key)) return;
     if (isChatGPTStreaming()) {
       window.setTimeout(checkAndCapture, 1000);
       return;
     }
     window.setTimeout(() => {
-      if (capturedMessageIds.has(messageId)) return;
+      if (isCaptureInProgress) return;
+      if (capturedMessageIds.has(key)) return;
       if (isChatGPTStreaming()) return;
-      capturedMessageIds.add(messageId);
-      handleSaveMemory("ChatGPT");
+      const text = getChatGPTMessageText(el);
+      if (!text) return;
+      isCaptureInProgress = true;
+      capturedMessageIds.add(key);
+      window.setTimeout(() => {
+        isCaptureInProgress = false;
+      }, 5000);
+      handleSaveMemory("ChatGPT", text);
     }, 3000);
   };
 
@@ -298,12 +419,24 @@ function scheduleChatGPTCapture(el: Element) {
 }
 
 function scheduleClaudeCapture(el: Element) {
-  if (capturedClaudeElements.has(el)) return;
+  if (isCaptureInProgress) return;
+
+  const key = getMessageKey(el);
+  if (!key) return;
+  if (capturedMessageIds.has(key)) return;
   if (isClaudeStreaming()) return;
-  capturedClaudeElements.add(el);
   window.setTimeout(() => {
+    if (isCaptureInProgress) return;
+    if (capturedMessageIds.has(key)) return;
     if (isClaudeStreaming()) return;
-    handleSaveMemory("Claude");
+    const text = (el.textContent || "").trim();
+    if (!text) return;
+    isCaptureInProgress = true;
+    capturedMessageIds.add(key);
+    window.setTimeout(() => {
+      isCaptureInProgress = false;
+    }, 5000);
+    handleSaveMemory("Claude", text);
   }, 3000);
 }
 
@@ -314,6 +447,7 @@ function init() {
   // In case of SPA navigation, check periodically to keep FAB present
   const observer = new MutationObserver((mutations) => {
     createFAB();
+    void maybeInjectContext();
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (!(node instanceof Element)) continue;
@@ -339,6 +473,7 @@ function init() {
   });
   
   observer.observe(document.body, { childList: true, subtree: true });
+  void maybeInjectContext();
 }
 
 // Run the script
