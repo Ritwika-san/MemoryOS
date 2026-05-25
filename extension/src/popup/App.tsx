@@ -14,6 +14,7 @@ import {
   ChevronUp
 } from 'lucide-react';
 import { Memory } from '../types';
+import { decryptText, deriveKey } from '../crypto';
 
 const API_BASE_URL = "http://127.0.0.1:8000";
 
@@ -135,7 +136,18 @@ export default function App() {
       }
 
       const data = await response.json();
-      setMemories(data);
+      const key = await deriveKey(authToken);
+      const decrypted = await Promise.all(
+        (data as Memory[]).map(async (m) => {
+          try {
+            const text = await decryptText(m.text, key);
+            return { ...m, text };
+          } catch {
+            return m;
+          }
+        })
+      );
+      setMemories(decrypted);
     } catch (err: any) {
       setError(err.message || "Failed to sync memories from server.");
     } finally {
