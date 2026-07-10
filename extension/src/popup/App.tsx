@@ -16,6 +16,19 @@ import {
 import { Memory } from '../types';
 import { decryptText, deriveKey } from '../crypto';
 
+const CATEGORY_ICONS: Record<string, string> = {
+  Technical: "🖥️",
+  Work: "💼",
+  Learning: "📚",
+  Personal: "👤",
+  Goals: "🎯",
+  Lifestyle: "🍕",
+  Background: "💬",
+  Miscellaneous: "📦",
+};
+
+const CATEGORY_ORDER = ["Technical", "Work", "Learning", "Personal", "Goals", "Lifestyle", "Background", "Miscellaneous"];
+
 const API_BASE_URL = "http://127.0.0.1:8000";
 
 export default function App() {
@@ -24,8 +37,10 @@ export default function App() {
   const [token, setToken] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isRegisterMode, setIsRegisterMode] = useState(false);
 
   // App state
   const [memories, setMemories] = useState<Memory[]>([]);
@@ -55,6 +70,36 @@ export default function App() {
     }
   }, []);
 
+  const persistToken = (userToken: string) => {
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+      chrome.storage.local.set({ token: userToken });
+    } else {
+      localStorage.setItem("token", userToken);
+    }
+  };
+
+  const loginWithCredentials = async (u: string, p: string) => {
+    const response = await fetch(`${API_BASE_URL}/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.detail || "Authentication failed");
+    }
+
+    const data = await response.json();
+    const userToken = data.access_token;
+    setToken(userToken);
+    setIsLoggedIn(true);
+    persistToken(userToken);
+    fetchMemories(userToken);
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!username || !password) {
@@ -66,7 +111,30 @@ export default function App() {
     setIsLoggingIn(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/login`, {
+      await loginWithCredentials(username, password);
+    } catch (err: any) {
+      setAuthError(err.message || "Could not connect to the API server.");
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!username || !password || !confirmPassword) {
+      setAuthError("Please fill in all fields.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setAuthError("Passwords don't match.");
+      return;
+    }
+
+    setAuthError("");
+    setIsLoggingIn(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/register`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -76,22 +144,10 @@ export default function App() {
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || "Authentication failed");
+        throw new Error(data.detail || "Registration failed");
       }
 
-      const data = await response.json();
-      const userToken = data.access_token;
-      
-      setToken(userToken);
-      setIsLoggedIn(true);
-      
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        chrome.storage.local.set({ token: userToken });
-      } else {
-        localStorage.setItem("token", userToken);
-      }
-      
-      fetchMemories(userToken);
+      await loginWithCredentials(username, password);
     } catch (err: any) {
       setAuthError(err.message || "Could not connect to the API server.");
     } finally {
@@ -136,14 +192,21 @@ export default function App() {
       }
 
       const data = await response.json();
-      const key = await deriveKey(authToken);
+      let key: CryptoKey | null = null;
+      try {
+        key = await deriveKey(authToken);
+      } catch {
+        key = null;
+      }
       const decrypted = await Promise.all(
         (data as Memory[]).map(async (m) => {
+          const originalText = typeof m?.text === "string" ? m.text : String(m?.text ?? "");
+          if (!key) return { ...m, text: originalText };
           try {
-            const text = await decryptText(m.text, key);
+            const text = await decryptText(originalText, key);
             return { ...m, text };
           } catch {
-            return m;
+            return { ...m, text: originalText };
           }
         })
       );
@@ -239,10 +302,19 @@ export default function App() {
   };
 
   // Filter memories
-  const filteredMemories = memories.filter(m => 
-    m.text.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    m.platform.toLowerCase().includes(searchQuery.toLowerCase())
+  // Filter memories
+  const filteredMemories = memories.filter(m =>
+    (m.summary || m.text).toLowerCase().includes(searchQuery.toLowerCase()) ||
+    m.platform.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (m.category || "").toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  // Group by category
+  const groupedMemories = CATEGORY_ORDER.reduce((acc, cat) => {
+    const catMemories = filteredMemories.filter(m => (m.category || "Miscellaneous") === cat);
+    if (catMemories.length > 0) acc[cat] = catMemories;
+    return acc;
+  }, {} as Record<string, Memory[]>);
 
   const pinnedCount = memories.filter(m => m.pinned).length;
   const activeCount = memories.length;
@@ -260,7 +332,7 @@ export default function App() {
           <p className="login-subtitle">Your AI memory companion</p>
         </div>
 
-        <form className="login-form" onSubmit={handleLogin}>
+        <form className="login-form" onSubmit={isRegisterMode ? handleRegister : handleLogin}>
           <div className="input-group">
             <input 
               type="text" 
@@ -276,7 +348,7 @@ export default function App() {
           <div className="input-group">
             <input 
               type="password" 
-              placeholder="Password" 
+              placeholder="Password"
               className="input-field" 
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -285,8 +357,44 @@ export default function App() {
             <Lock />
           </div>
 
+          {isRegisterMode && (
+            <div className="input-group">
+              <input
+                type="password"
+                placeholder="Confirm password"
+                className="input-field"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                disabled={isLoggingIn}
+              />
+              <Lock />
+            </div>
+          )}
+
           <button type="submit" className="login-btn" disabled={isLoggingIn}>
-            {isLoggingIn ? "Authenticating..." : "Sign In"}
+            {isLoggingIn
+              ? (isRegisterMode ? "Creating account..." : "Authenticating...")
+              : (isRegisterMode ? "Register" : "Sign In")}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setAuthError("");
+              setConfirmPassword("");
+              setIsRegisterMode((v) => !v);
+            }}
+            disabled={isLoggingIn}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--secondary)",
+              fontSize: "12px",
+              cursor: "pointer",
+              marginTop: "4px",
+            }}
+          >
+            {isRegisterMode ? "Back to sign in" : "Create account"}
           </button>
           
           {authError && (
@@ -370,57 +478,69 @@ export default function App() {
               <div className="skeleton-card"></div>
             </>
           ) : filteredMemories.length > 0 ? (
-            filteredMemories.map((memory) => {
-              const isExpanded = expandedMemoryId === memory.id;
-              
-              return (
-                <div key={memory.id} className={`memory-card ${memory.pinned ? 'pinned' : ''}`}>
-                  <div className="memory-card-header">
-                    <span className={`platform-badge ${memory.platform.toLowerCase() === 'chatgpt' ? 'chatgpt' : ''}`}>
-                      <FileText size={10} />
-                      {memory.platform}
-                    </span>
-                    <span className={`decay-badge ${getDecayClass(memory.decay_score)}`}>
-                      Score: {memory.pinned ? "1.00" : memory.decay_score.toFixed(2)}
-                    </span>
-                  </div>
-
-                  <div 
-                    className="memory-body" 
-                    onClick={() => setExpandedMemoryId(isExpanded ? null : memory.id)}
-                  >
-                    <p className={isExpanded ? "memory-text-full" : "memory-text-excerpt"}>
-                      {memory.text}
-                    </p>
-                    <div style={{ display: 'flex', justifyContent: 'center', marginTop: '4px', color: 'var(--text-muted)' }}>
-                      {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                    </div>
-                  </div>
-
-                  <div className="memory-footer">
-                    <span className="memory-timestamp">
-                      {formatTimeAgo(memory.timestamp)}
-                    </span>
-                    <div className="card-actions">
-                      <button 
-                        className={`card-action-btn pin-btn ${memory.pinned ? 'pinned' : ''}`}
-                        onClick={() => handleTogglePin(memory.id)}
-                        title={memory.pinned ? "Unpin memory" : "Pin memory"}
-                      >
-                        <Pin size={13} fill={memory.pinned ? "currentColor" : "none"} />
-                      </button>
-                      <button 
-                        className="card-action-btn delete-btn"
-                        onClick={() => handleDelete(memory.id)}
-                        title="Delete memory"
-                      >
-                        <Trash2 size={13} />
-                      </button>
-                    </div>
-                  </div>
+            Object.entries(groupedMemories).map(([category, catMemories]) => (
+              <div key={category} className="category-group">
+                <div className="category-header">
+                  <span className="category-icon">{CATEGORY_ICONS[category] || "📦"}</span>
+                  <span className="category-name">{category}</span>
+                  <span className="category-count">{catMemories.length}</span>
                 </div>
-              );
-            })
+                {catMemories.map((memory) => {
+                  const isExpanded = expandedMemoryId === memory.id;
+                  const displayText = memory.summary || memory.text;
+                  return (
+                    <div key={memory.id} className={`memory-card ${memory.pinned ? 'pinned' : ''}`}>
+                      <div className="memory-card-header">
+                        <span className={`platform-badge ${memory.platform.toLowerCase() === 'chatgpt' ? 'chatgpt' : ''}`}>
+                          <FileText size={10} />
+                          {memory.platform}
+                        </span>
+                        <span className={`decay-badge ${getDecayClass(memory.decay_score)}`}>
+                          Score: {memory.pinned ? "1.00" : memory.decay_score.toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div
+                        className="memory-body"
+                        onClick={() => setExpandedMemoryId(isExpanded ? null : memory.id)}
+                      >
+                        <p className="memory-summary">{displayText}</p>
+                        {isExpanded && memory.text !== memory.summary && (
+                          <p className="memory-text-full" style={{ marginTop: '8px', opacity: 0.7, fontSize: '11px' }}>
+                            {memory.text}
+                          </p>
+                        )}
+                        <div style={{ display: 'flex', justifyContent: 'center', marginTop: '4px', color: 'var(--text-muted)' }}>
+                          {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                        </div>
+                      </div>
+
+                      <div className="memory-footer">
+                        <span className="memory-timestamp">
+                          {formatTimeAgo(memory.timestamp)}
+                        </span>
+                        <div className="card-actions">
+                          <button
+                            className={`card-action-btn pin-btn ${memory.pinned ? 'pinned' : ''}`}
+                            onClick={() => handleTogglePin(memory.id)}
+                            title={memory.pinned ? "Unpin memory" : "Pin memory"}
+                          >
+                            <Pin size={13} fill={memory.pinned ? "currentColor" : "none"} />
+                          </button>
+                          <button
+                            className="card-action-btn delete-btn"
+                            onClick={() => handleDelete(memory.id)}
+                            title="Delete memory"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))
           ) : (
             <div className="empty-state">
               <div className="empty-icon">
@@ -428,8 +548,8 @@ export default function App() {
               </div>
               <p className="empty-title">No Memories Yet</p>
               <p className="empty-desc">
-                {searchQuery 
-                  ? "Try searching for another keyword or term." 
+                {searchQuery
+                  ? "Try searching for another keyword or term."
                   : "Open ChatGPT, double check you are logged in, and click the brain button to capture a memory."}
               </p>
             </div>

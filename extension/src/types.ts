@@ -1,6 +1,8 @@
 export interface Memory {
   id: string;
   text: string;
+  summary: string;
+  category: string;
   platform: string;
   timestamp: string;
   decay_score: number;

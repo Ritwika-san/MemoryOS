@@ -1,5 +1,3 @@
-// Background service worker for MemoryOS
-
 import { deriveKey, encryptText } from "./crypto";
 
 const API_BASE_URL = "http://127.0.0.1:8000";
@@ -10,9 +8,8 @@ interface ChromeStorageData {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "SAVE_MEMORY") {
-    const { text, platform, timestamp, decay_score } = message.payload;
+    const { text, plain_text, platform, timestamp, decay_score } = message.payload;
     
-    // Retrieve credentials from Chrome storage
     chrome.storage.local.get(["token"], (result: ChromeStorageData) => {
       const token = result.token;
       
@@ -37,6 +34,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             },
             body: JSON.stringify({
               text: encryptedText,
+              plain_text: plain_text || text,
               platform,
               timestamp,
               decay_score
@@ -67,6 +65,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       })();
     });
     
-    return true; // Keep message channel open for asynchronous sendResponse
+    return true;
   }
 });

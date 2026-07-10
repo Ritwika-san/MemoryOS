@@ -386,20 +386,8 @@ function detectPlatform() {
   return "ChatGPT";
 }
 
-const injectedConversationKeys = new Set<string>();
-const injectingConversationKeys = new Set<string>();
-
-function getChatGPTConversationKey() {
-  if (!window.location.hostname.includes("chatgpt.com")) return null;
-  const match = window.location.pathname.match(/\/c\/([^/?#]+)/);
-  if (!match) return null;
-  return `chatgpt:${match[1]}`;
-}
-
-function getClaudeConversationKey() {
-  if (!window.location.hostname.includes("claude.ai")) return null;
-  return `claude:${window.location.pathname}${window.location.search}`;
-}
+const injectedConversationIds = new Set<string>();
+let isInjectInProgress = false;
 
 function getStoredToken(): Promise<string | null> {
   return new Promise((resolve) => {
@@ -443,19 +431,29 @@ function setContentEditableHTML(el: Element, html: string) {
 
 async function maybeInjectContext() {
   const platform = detectPlatform();
-  const key = platform === "Claude" ? getClaudeConversationKey() : getChatGPTConversationKey();
-  if (!key) return;
-  if (injectedConversationKeys.has(key) || injectingConversationKeys.has(key)) return;
+  if (isInjectInProgress) return;
 
+  // Generate a conversation ID — use URL path or "home" for chatgpt.com/
+  let conversationId: string;
   if (platform === "ChatGPT") {
-    if (document.querySelectorAll("div[data-message-author-role='assistant']").length > 0) return;
-    if (!document.querySelector("div#prompt-textarea[contenteditable=true]")) return;
+    const match = window.location.pathname.match(/\/c\/([^/?#]+)/);
+    conversationId = match ? `chatgpt:${match[1]}` : "chatgpt:home";
   } else {
-    if (document.querySelectorAll(".font-claude-message").length > 0) return;
-    if (!document.querySelector("div[contenteditable=true].ProseMirror")) return;
+    conversationId = `claude:${window.location.pathname}`;
   }
 
-  injectingConversationKeys.add(key);
+  if (injectedConversationIds.has(conversationId)) return;
+
+  // Check input box exists
+  if (platform === "ChatGPT") {
+    if (!document.querySelector("div#prompt-textarea")) return;
+    if (document.querySelectorAll("div[data-message-author-role='assistant']").length > 0) return;
+  } else {
+    if (!document.querySelector("div[contenteditable=true].ProseMirror")) return;
+    if (document.querySelectorAll(".font-claude-message").length > 0) return;
+  }
+
+  isInjectInProgress = true;
   try {
     const token = await getStoredToken();
     if (!token) return;
@@ -463,13 +461,9 @@ async function maybeInjectContext() {
     const cryptoKey = await deriveKey(token);
     const decrypted = await Promise.all(
       memories.map(async (m) => {
-        const raw = String(m?.text || "").trim();
+        const raw = String(m?.summary || m?.text || "").trim();
         if (!raw) return "";
-        try {
-          return await decryptText(raw, cryptoKey);
-        } catch {
-          return "";
-        }
+        try { return await decryptText(raw, cryptoKey); } catch { return raw; }
       })
     );
     const trimmed = decrypted
@@ -481,7 +475,7 @@ async function maybeInjectContext() {
     if (!context) return;
 
     if (platform === "ChatGPT") {
-      const input = document.querySelector("div#prompt-textarea[contenteditable=true]");
+      const input = document.querySelector("div#prompt-textarea");
       if (!input) return;
       setContentEditableHTML(input, context);
     } else {
@@ -490,15 +484,15 @@ async function maybeInjectContext() {
       setContentEditableHTML(input, context);
     }
 
-    injectedConversationKeys.add(key);
+    injectedConversationIds.add(conversationId);
     showToast("success", "Context injected from MemoryOS", "Your AI already knows you.");
   } finally {
-    injectingConversationKeys.delete(key);
+    isInjectInProgress = false;
   }
 }
 
 // 4. Capture and Process Assistant Message
-function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?: string, isAutoCapture?: boolean) {
+function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?: string, _isAutoCapture?: boolean) {
   const platform = platformOverride || detectPlatform();
   let text = "";
 
@@ -542,16 +536,17 @@ function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?
   const previewText = text.length > 60 ? text.substring(0, 60) + "..." : text;
   
   // Send message to the background service worker
-  chrome.runtime.sendMessage(
-    {
-      type: "SAVE_MEMORY",
-      payload: {
-        text: text,
-        platform: platform,
-        timestamp: new Date().toISOString(),
-        decay_score: 1.0 // Defaults to 1.0 (fresh memory)
-      }
-    },
+ chrome.runtime.sendMessage(
+  {
+    type: "SAVE_MEMORY",
+    payload: {
+      text: text,
+      plain_text: text,   
+      platform: platform,
+      timestamp: new Date().toISOString(),
+      decay_score: 1.0
+    }
+  },
     (response) => {
       // Handle the response
       if (chrome.runtime.lastError) {
@@ -561,9 +556,7 @@ function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?
       
       if (response && response.success) {
         showToast("success", "Memory Saved!", `"${previewText}" was added to MemoryOS.`);
-        if (isAutoCapture) {
-          void checkStaleMemories();
-        }
+        void checkStaleMemories();
       } else {
         const errorMsg = response?.error || "Are you logged into the MemoryOS popup?";
         showToast("error", "Save Failed", errorMsg);
@@ -661,6 +654,14 @@ function scheduleClaudeCapture(el: Element) {
 // 5. Initialize Content Script
 function init() {
   createFAB();
+
+  let lastUrl = window.location.href;
+  window.setInterval(() => {
+    const current = window.location.href;
+    if (current === lastUrl) return;
+    lastUrl = current;
+    void maybeInjectContext();
+  }, 500);
   
   // In case of SPA navigation, check periodically to keep FAB present
   const observer = new MutationObserver((mutations) => {
