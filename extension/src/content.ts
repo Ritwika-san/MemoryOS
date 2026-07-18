@@ -450,7 +450,7 @@ async function maybeInjectContext() {
     if (document.querySelectorAll("div[data-message-author-role='assistant']").length > 0) return;
   } else {
     if (!document.querySelector("div[contenteditable=true].ProseMirror")) return;
-    if (document.querySelectorAll(".font-claude-message").length > 0) return;
+    if (document.querySelectorAll(".font-claude-response, div.standard-markdown").length > 0) return;
   }
 
   isInjectInProgress = true;
@@ -499,7 +499,7 @@ function handleSaveMemory(platformOverride?: "ChatGPT" | "Claude", textOverride?
   if (textOverride) {
     text = textOverride;
   } else if (platform === "Claude") {
-    const selectors = ["div[data-is-streaming]", ".font-claude-message", "div.grid.gap-2"];
+    const selectors = [".font-claude-response", ".font-claude-response-body", "div.standard-markdown", ".font-claude-message"];
     let lastEl: Element | null = null;
     for (const selector of selectors) {
       const matches = document.querySelectorAll(selector);
@@ -674,7 +674,7 @@ function init() {
         if (node.matches("div[data-message-author-role='assistant']")) {
           scheduleChatGPTCapture(node);
         }
-        if (node.matches("div.font-claude-message")) {
+        if (node.matches("div.standard-markdown") || node.matches(".font-claude-response")) {
           scheduleClaudeCapture(node);
         }
 
@@ -683,7 +683,7 @@ function init() {
           chatgptNodes.forEach((n) => scheduleChatGPTCapture(n));
         }
 
-        const claudeNodes = node.querySelectorAll?.("div.font-claude-message");
+        const claudeNodes = node.querySelectorAll?.("div.standard-markdown, .font-claude-response");
         if (claudeNodes && claudeNodes.length > 0) {
           claudeNodes.forEach((n) => scheduleClaudeCapture(n));
         }
